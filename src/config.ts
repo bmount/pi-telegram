@@ -4,7 +4,10 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import type { TranscriptionConfig } from "./transcription.ts";
+
 interface TelegramConfig {
+	transcription?: TranscriptionConfig;
 	apiRoot?: string;
 	botToken?: string;
 	allowedUserId?: number;
@@ -44,6 +47,17 @@ type ConfigManager = {
 
 export async function createConfig(): Promise<ConfigManager> {
 	let config = await readConfig();
+	// A separate optional file allows enabling voice while an older bridge is
+	// still polling/writing telegram.json. Explicit inline config takes precedence.
+	if (config.transcription === undefined) {
+		try {
+			config.transcription = JSON.parse(
+				await readFile(join(homedir(), ".pi", "agent", "telegram-transcription.json"), "utf8"),
+			) as TranscriptionConfig;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+		}
+	}
 	validateConfig(config);
 	return {
 		get: () => config,

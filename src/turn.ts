@@ -44,6 +44,9 @@ export function createTurn(deps: TurnDeps) {
 	let active: TelegramTurn | undefined;
 	let currentAbort: (() => void) | undefined;
 	let typingInterval: ReturnType<typeof setInterval> | undefined;
+	let preparationQueue: Promise<void> = Promise.resolve();
+	const preparing = new Set<AbortController>();
+	let shutDown = false;
 
 	function startTyping(chatId: number): void {
 		if (typingInterval) return;
@@ -66,10 +69,10 @@ export function createTurn(deps: TurnDeps) {
 		typingInterval = undefined;
 	}
 
-	async function build(messages: TelegramMessage[]): Promise<TelegramTurn> {
+	async function build(messages: TelegramMessage[], ctx: ExtensionContext, signal: AbortSignal): Promise<TelegramTurn> {
 		const firstMessage = messages[0];
 		if (!firstMessage) throw new Error("Missing Telegram message for turn creation");
-		const content = await media.buildPromptContent(messages);
+		const content = await media.buildPromptContent(messages, ctx, signal);
 		return {
 			chatId: firstMessage.chat.id,
 			queuedAttachments: [],
@@ -113,6 +116,8 @@ export function createTurn(deps: TurnDeps) {
 	});
 
 	pi.on("session_shutdown", async (_event, _ctx) => {
+		shutDown = true;
+		for (const controller of preparing) controller.abort();
 		await toolMessages.finalize();
 		await preview.finalize();
 		pending = undefined;
@@ -189,29 +194,49 @@ export function createTurn(deps: TurnDeps) {
 	/** Dispatch a new batch of Telegram messages. Starts a fresh turn (if idle)
 	 *  or steers into the running one. */
 	async function handleIncoming(messages: TelegramMessage[], ctx: ExtensionContext): Promise<void> {
-		const built = await build(messages);
-		// Pi reports idle before settled handlers finish. A new Telegram message
-		// in that window belongs to the next run, not the previous run's steering.
-		const isFresh = !pending && (!active || ctx.isIdle());
-		if (isFresh) {
-			pending = built;
-			startTyping(built.chatId);
-		}
-		pi.sendUserMessage(built.content, {
-			expandPromptTemplates: true,
-			...(isFresh ? {} : { deliverAs: "steer" }),
+		const firstMessage = messages[0];
+		if (shutDown || !firstMessage) return;
+		const controller = new AbortController();
+		preparing.add(controller);
+		// Keep polling free to receive /stop while preserving incoming message order.
+		preparationQueue = preparationQueue.then(async () => {
+			try {
+				controller.signal.throwIfAborted();
+				if (shutDown) return;
+				startTyping(firstMessage.chat.id);
+				const built = await build(messages, ctx, controller.signal);
+				controller.signal.throwIfAborted();
+				if (shutDown) return;
+				// Pi reports idle before settled handlers finish.
+				const isFresh = !pending && (!active || ctx.isIdle());
+				if (isFresh) pending = built;
+				pi.sendUserMessage(built.content, {
+					expandPromptTemplates: true,
+					...(isFresh ? {} : { deliverAs: "steer" }),
+				});
+			} catch (error) {
+				if (!controller.signal.aborted && !shutDown) {
+					const reason = error instanceof Error ? error.message : String(error);
+					await api.sendText(firstMessage.chat.id, `Telegram input failed: ${reason}`).catch(() => {});
+				}
+			} finally {
+				preparing.delete(controller);
+				if (!active && !pending && preparing.size === 0) stopTyping();
+			}
 		});
 	}
 
 	/** Abort the active turn. Returns true iff one was active. */
 	function abort(): boolean {
+		const hadPreparation = preparing.size > 0;
+		for (const controller of preparing) controller.abort();
 		if (currentAbort) {
 			if (active) active.abortRequested = true;
 			currentAbort();
 			return true;
 		}
-		return false;
+		return hadPreparation;
 	}
 
-	return { handleIncoming, abort };
+	return { handleIncoming, abort, isPreparing: () => preparing.size > 0 };
 }

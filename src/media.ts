@@ -3,7 +3,9 @@
 
 import { readFile } from "node:fs/promises";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { createApi } from "./api.ts";
+import type { createTranscription } from "./transcription.ts";
 import type { TelegramMessage } from "./types.ts";
 import { guessExtensionFromMime, guessMediaType, isImageMimeType } from "./utils.ts";
 
@@ -12,12 +14,14 @@ interface TelegramFileInfo {
 	fileName: string;
 	mimeType: string | undefined;
 	isImage: boolean;
+	isVoice?: boolean;
 }
 
 interface DownloadedTelegramFile {
 	path: string;
 	isImage: boolean;
 	mimeType: string | undefined;
+	isVoice?: boolean;
 }
 
 /** Outbound file queued by telegram_attach, sent when the agent settles. */
@@ -26,7 +30,7 @@ export interface QueuedAttachment {
 	fileName: string;
 }
 
-export function createMedia(api: ReturnType<typeof createApi>) {
+export function createMedia(api: ReturnType<typeof createApi>, transcription?: ReturnType<typeof createTranscription>) {
 	function collectFileInfos(messages: TelegramMessage[]): TelegramFileInfo[] {
 		const files: TelegramFileInfo[] = [];
 		for (const m of messages) {
@@ -68,6 +72,7 @@ export function createMedia(api: ReturnType<typeof createApi>) {
 					fileName: `voice-${m.message_id}${guessExtensionFromMime(m.voice.mime_type, ".ogg")}`,
 					mimeType: m.voice.mime_type,
 					isImage: false,
+					isVoice: true,
 				});
 			if (m.animation)
 				files.push({
@@ -93,13 +98,24 @@ export function createMedia(api: ReturnType<typeof createApi>) {
 		const downloaded: DownloadedTelegramFile[] = [];
 		for (const file of collectFileInfos(messages)) {
 			const path = await api.download(file.file_id, file.fileName);
-			downloaded.push({ path, isImage: file.isImage, mimeType: file.mimeType });
+			downloaded.push({
+				path,
+				isImage: file.isImage,
+				mimeType: file.mimeType,
+				...(file.isVoice ? { isVoice: true } : {}),
+			});
 		}
 		return downloaded;
 	}
 
 	/** Build LLM-bound prompt content: text + attachment paths + inline images. */
-	async function buildPromptContent(messages: TelegramMessage[]): Promise<Array<TextContent | ImageContent>> {
+	async function buildPromptContent(
+		messages: TelegramMessage[],
+		ctx?: ExtensionContext,
+		signal?: AbortSignal,
+	): Promise<Array<TextContent | ImageContent>> {
+		const firstMessage = messages[0];
+		if (!firstMessage) throw new Error("Missing Telegram input");
 		const rawText = messages
 			.map((m) => (m.text || m.caption || "").trim())
 			.filter(Boolean)
@@ -108,6 +124,21 @@ export function createMedia(api: ReturnType<typeof createApi>) {
 		const content: Array<TextContent | ImageContent> = [];
 
 		let prompt = rawText;
+		for (const file of files) {
+			if (!file.isVoice || !transcription?.enabled()) continue;
+			if (!ctx || !signal) throw new Error("Missing transcription runtime context");
+			signal.throwIfAborted();
+			const text = await transcription.transcribe(file.path, ctx, signal);
+			signal.throwIfAborted();
+			// Plain Telegram messages preserve raw spelling and punctuation (no Markdown interpretation).
+			for (let offset = 0; offset < text.length; offset += 3500) {
+				await api.call("sendMessage", {
+					chat_id: firstMessage.chat.id,
+					text: `${offset === 0 ? "Raw voice transcription:\n\n" : "Transcription continued:\n\n"}${text.slice(offset, offset + 3500)}`,
+				});
+			}
+			prompt += `${prompt ? "\n\n" : ""}Voice transcription (raw ASR, already echoed to Telegram; may contain recognition errors):\n${text}`;
+		}
 		if (files.length > 0) {
 			if (prompt) prompt += "\n\n";
 			prompt += "Attachments saved locally:";

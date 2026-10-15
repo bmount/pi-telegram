@@ -7,6 +7,7 @@
 // and fire `/telegram-execute-action` to bounce through a registered command
 // handler whose ctx has the right type.
 
+import type { Usage } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -15,6 +16,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { type createApi, MAX_MESSAGE_LENGTH } from "./api.ts";
+import type { createTranscription } from "./transcription.ts";
 import type { createTurn } from "./turn.ts";
 import type { TelegramMessage } from "./types.ts";
 import { formatTokens, lastAssistantText } from "./utils.ts";
@@ -31,16 +33,19 @@ const BOT_COMMANDS = [
 	{ command: "status", description: "Show usage info" },
 	{ command: "compact", description: "Compact conversation" },
 	{ command: "skills", description: "List available skills" },
+	{ command: "transcription", description: "Show last voice transcript and temporary hints" },
+	{ command: "reload", description: "Reload Pi extensions and configuration" },
 ];
 
 interface DispatcherDeps {
 	pi: ExtensionAPI;
 	api: ReturnType<typeof createApi>;
 	turn: ReturnType<typeof createTurn>;
+	transcription: ReturnType<typeof createTranscription>;
 }
 
 export function createDispatcher(deps: DispatcherDeps): Dispatcher {
-	const { pi, api, turn } = deps;
+	const { pi, api, turn, transcription } = deps;
 
 	// Cache last /resume listing for index lookup; per-closure (cleared on session swap).
 	let lastList: SessionInfo[] | undefined;
@@ -76,10 +81,19 @@ export function createDispatcher(deps: DispatcherDeps): Dispatcher {
 		const lower = rawText.toLowerCase();
 		const reply = (text: string) => api.sendText(firstMessage.chat.id, text);
 		const requireIdle = async (action: string): Promise<boolean> => {
-			if (ctx.isIdle()) return true;
+			if (ctx.isIdle() && !turn.isPreparing()) return true;
 			await reply(`Cannot ${action} while pi is busy. Send /stop first.`);
 			return false;
 		};
+
+		if (lower === "/reload") {
+			if (!(await requireIdle("reload"))) return;
+			trampoline(async (cmdCtx) => {
+				await reply("Reloading Pi extensions and configuration…");
+				await cmdCtx.reload();
+			});
+			return;
+		}
 
 		if (lower === "/new") {
 			if (!(await requireIdle("start new session"))) return;
@@ -177,6 +191,19 @@ export function createDispatcher(deps: DispatcherDeps): Dispatcher {
 			return;
 		}
 
+		if (lower === "/transcription") {
+			const last = transcription.getLast();
+			const text = !transcription.enabled()
+				? "Voice transcription is disabled."
+				: !last
+					? "Voice transcription enabled. No voice note transcribed in this session yet."
+					: `Last raw transcription:\n${last.text}\n\nBackend: ${last.backend}${last.localFallback ? "; hosted unavailable, local fallback" : ""}\n\nTemporary spelling hints (${last.contextMessages} recent messages${last.fallback ? "; extractor unavailable, recent-text fallback" : ""}):\n${last.prompt || "(none)"}\n\nNo permanent vocabulary is created.`;
+			for (let offset = 0; offset < text.length; offset += 3500) {
+				await api.call("sendMessage", { chat_id: firstMessage.chat.id, text: text.slice(offset, offset + 3500) });
+			}
+			return;
+		}
+
 		// Default: forward as a regular agent turn.
 		await turn.handleIncoming(messages, ctx);
 	};
@@ -207,12 +234,18 @@ function buildStatusReport(ctx: ExtensionContext): string {
 		totalCacheWrite = 0,
 		totalCost = 0;
 	for (const entry of ctx.sessionManager.getEntries()) {
-		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-		totalInput += entry.message.usage.input;
-		totalOutput += entry.message.usage.output;
-		totalCacheRead += entry.message.usage.cacheRead;
-		totalCacheWrite += entry.message.usage.cacheWrite;
-		totalCost += entry.message.usage.cost.total;
+		const usage =
+			entry.type === "message" && entry.message.role === "assistant"
+				? entry.message.usage
+				: entry.type === "custom" && entry.customType === "telegram-transcription-usage"
+					? (entry.data as { usage?: Usage } | undefined)?.usage
+					: undefined;
+		if (!usage) continue;
+		totalInput += usage.input;
+		totalOutput += usage.output;
+		totalCacheRead += usage.cacheRead;
+		totalCacheWrite += usage.cacheWrite;
+		totalCost += usage.cost.total;
 	}
 	const usage = ctx.getContextUsage();
 	const rows: string[] = [];

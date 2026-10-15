@@ -1,1 +1,8 @@
 node_modules
+
+# Local credentials and private bridge configuration
+.env
+.env.*
+*.key
+telegram.json
+telegram-transcription.json

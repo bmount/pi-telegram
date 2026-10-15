@@ -7,14 +7,16 @@ import { createDispatcher } from "./dispatch.ts";
 import { createMedia } from "./media.ts";
 import { createPolling } from "./polling.ts";
 import { createPreview } from "./preview.ts";
+import { createTranscription } from "./transcription.ts";
 import { createTurn } from "./turn.ts";
 
 export default async function (pi: ExtensionAPI) {
 	const config = await createConfig();
 	const api = createApi(config);
 	const preview = createPreview(api);
-	const media = createMedia(api);
+	const transcription = createTranscription(pi, () => config.get().transcription);
+	const media = createMedia(api, transcription);
 	const turn = createTurn({ pi, api, media, preview });
-	const dispatch = createDispatcher({ pi, api, turn });
+	const dispatch = createDispatcher({ pi, api, turn, transcription });
 	createPolling({ pi, api, config, dispatch });
 }
